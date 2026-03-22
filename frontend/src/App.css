@@ -1,0 +1,5 @@
+/* Base app styles */
+html, body, #root {
+  width: 100%;
+  min-height: 100%;
+}
