@@ -6,6 +6,12 @@ const options = {
 
 let primaryMonitorTimer = null;
 let isSwitching = false;
+let isIntentionalDisconnect = false;
+let listenersAttached = false;
+let activeTarget = null;
+
+let currentPrimaryUri = null;
+let currentFallbackUri = null;
 
 const parseRecheckIntervalMs = () => {
   const raw = process.env.MONGODB_PRIMARY_RECHECK_INTERVAL_MS;
@@ -23,6 +29,67 @@ const stopPrimaryMonitor = () => {
     clearInterval(primaryMonitorTimer);
     primaryMonitorTimer = null;
   }
+};
+
+const connectToTarget = async (uri, label) => {
+  if (mongoose.connection.readyState !== 0) {
+    isIntentionalDisconnect = true;
+    await mongoose.disconnect().catch(() => {});
+    isIntentionalDisconnect = false;
+  }
+
+  const conn = await mongoose.connect(uri, options);
+  activeTarget = label;
+  return conn;
+};
+
+const failoverToFallback = async (reason) => {
+  if (!currentFallbackUri || currentFallbackUri === currentPrimaryUri) {
+    console.error(`Primary MongoDB lost and no valid fallback is configured. Reason: ${reason}`);
+    process.exit(1);
+  }
+
+  if (isSwitching) {
+    return;
+  }
+
+  isSwitching = true;
+
+  try {
+    console.warn(`Primary MongoDB lost during runtime. Switching to fallback. Reason: ${reason}`);
+    const conn = await connectToTarget(currentFallbackUri, 'fallback');
+    console.log(`MongoDB Connected (fallback): ${conn.connection.host}`);
+    startPrimaryMonitor(currentPrimaryUri);
+  } catch (error) {
+    console.error(`Runtime failover to fallback failed: ${error.message}`);
+    process.exit(1);
+  } finally {
+    isSwitching = false;
+  }
+};
+
+const attachConnectionListeners = () => {
+  if (listenersAttached) {
+    return;
+  }
+
+  listenersAttached = true;
+
+  mongoose.connection.on('disconnected', () => {
+    if (isIntentionalDisconnect) {
+      return;
+    }
+
+    if (activeTarget === 'primary') {
+      failoverToFallback('mongoose connection emitted disconnected').catch(() => {});
+    }
+  });
+
+  mongoose.connection.on('error', (error) => {
+    if (activeTarget === 'primary') {
+      console.warn(`MongoDB connection error on primary: ${error.message}`);
+    }
+  });
 };
 
 const canConnectToPrimary = async (primaryUri) => {
@@ -61,8 +128,7 @@ const startPrimaryMonitor = (primaryUri) => {
       }
 
       console.log('Primary MongoDB is reachable again. Switching from fallback to primary.');
-      await mongoose.disconnect();
-      const conn = await mongoose.connect(primaryUri, options);
+      const conn = await connectToTarget(primaryUri, 'primary');
       console.log(`MongoDB Connected (primary): ${conn.connection.host}`);
       stopPrimaryMonitor();
     } catch (error) {
@@ -77,13 +143,18 @@ const connectDB = async () => {
   const primaryUri = process.env.MONGODB_URI;
   const fallbackUri = process.env.MONGODB_FALLBACK_URI;
 
+  currentPrimaryUri = primaryUri;
+  currentFallbackUri = fallbackUri;
+
+  attachConnectionListeners();
+
   if (!primaryUri) {
     console.error('Error connecting to MongoDB: MONGODB_URI is not set');
     process.exit(1);
   }
 
   try {
-    const conn = await mongoose.connect(primaryUri, options);
+    const conn = await connectToTarget(primaryUri, 'primary');
     console.log(`MongoDB Connected (primary): ${conn.connection.host}`);
     stopPrimaryMonitor();
     return conn;
@@ -98,7 +169,7 @@ const connectDB = async () => {
     );
 
     try {
-      const conn = await mongoose.connect(fallbackUri, options);
+      const conn = await connectToTarget(fallbackUri, 'fallback');
       console.log(`MongoDB Connected (fallback): ${conn.connection.host}`);
       startPrimaryMonitor(primaryUri);
       return conn;
